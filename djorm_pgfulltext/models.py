@@ -7,6 +7,7 @@ from django.db.models.query import QuerySet
 from django.utils.encoding import smart_text
 
 from djorm_pgfulltext.utils import adapt
+from djorm_pgfulltext.fields import VectorField
 
 # Compatibility import and fixes section.
 
@@ -88,6 +89,7 @@ class SearchManagerMixIn(object):
 
     def __init__(self,
                  fields=None,
+                 ft_model=None,
                  search_field='search_index',
                  config='pg_catalog.english',
                  auto_update_search_field=False):
@@ -96,6 +98,8 @@ class SearchManagerMixIn(object):
         self.config = config
         self.auto_update_search_field = auto_update_search_field
         self._fields = fields
+
+        self._ft_model = ft_model if ft_model else self.model
 
         super(SearchManagerMixIn, self).__init__()
 
@@ -140,6 +144,9 @@ class SearchManagerMixIn(object):
         :param config: config of full text search
         :param using: DB we are using
         """
+
+        # TODO: Make this work with foreign model functionality - 2016-01-12
+
         if not search_field:
             search_field = self.search_field
 
@@ -160,6 +167,7 @@ class SearchManagerMixIn(object):
 
         where_sql = ''
         params = []
+
         if pk is not None:
             if isinstance(pk, (list, tuple)):
                 params = pk
@@ -167,13 +175,14 @@ class SearchManagerMixIn(object):
                 params = [pk]
 
             where_sql = "WHERE %s IN (%s)" % (
-                qn(self.model._meta.pk.column),
+                qn(self._ft_model._meta.pk.column),
                 ','.join(repeat("%s", len(params)))
             )
 
         search_vector = self._get_search_vector(config, using, fields=fields, extra=extra)
+
         sql = "UPDATE %s SET %s = %s %s;" % (
-            qn(self.model._meta.db_table),
+            qn(self._ft_model._meta.db_table),
             qn(search_field),
             search_vector or "''",
             where_sql
@@ -183,8 +192,29 @@ class SearchManagerMixIn(object):
             cursor = connection.cursor()
             cursor.execute(sql, params)
 
+        # # if storing vectors in a different model
+        # if (self.model != self._ft_model):
+        #     set_fields = ",".join([ "SET %s = %s" % (
+        #         qn(field),
+        #         self._get_vector_for_field(field)
+        #     ) for field in fields ])
+
+        #     print(set_fields)
+
+        #     sql = "UPDATE %s %s %s;" % (
+        #         qn(self._ft_model._meta.db_table),
+        #         set_fields,
+        #         # qn(search_field),
+        #         # search_vector or "''",
+        #         where_sql,
+        #     )
+
+        # with atomic():
+        #     cursor = connection.cursor()
+        #     cursor.execute(sql, params)
+
     def _find_text_fields(self):
-        fields = [f for f in self.model._meta.fields
+        fields = [f for f in self._ft_model._meta.fields
                   if isinstance(f, (models.CharField, models.TextField))]
 
         return [(f.name, None) for f in fields]
@@ -204,10 +234,12 @@ class SearchManagerMixIn(object):
                 parsed_fields.update([(x, None) for x in fields])
 
             # Does not support field.attname.
-            field_names = set(field.name for field in self.model._meta.fields if not field.primary_key)
+            field_names = set(field.name for field in self._ft_model._meta.fields if not field.primary_key)
+
             non_model_fields = set(x[0] for x in parsed_fields).difference(field_names)
+
             if non_model_fields:
-                raise ValueError("The following fields do not exist in this"
+                raise ValueError("The following fields do not exist in the specified"
                                  " model: {0}".format(", ".join(x for x in non_model_fields)))
         else:
             parsed_fields.update(self._find_text_fields())
@@ -216,7 +248,7 @@ class SearchManagerMixIn(object):
 
     def _get_search_vector(self, configs, using, fields=None, extra=None):
         if fields is None:
-            vector_fields = self._parse_fields(self._fields)
+            vector_fields = [(self.search_field, None)]
         else:
             vector_fields = self._parse_fields(fields)
 
@@ -241,7 +273,7 @@ class SearchManagerMixIn(object):
         if using is None:
             using = self.db
 
-        field = self.model._meta.get_field(field_name)
+        field = self._ft_model._meta.get_field(field_name)
 
         ret = None
 
@@ -258,8 +290,12 @@ class SearchManagerMixIn(object):
         connection = connections[using]
         qn = connection.ops.quote_name
 
-        return "setweight(to_tsvector('%s', coalesce(%s.%s, '')), '%s')" % \
-               (config, qn(field.model._meta.db_table), qn(field.column), weight)
+        if (isinstance(field, VectorField)):
+            return "setweight(%s.%s, '%s')" % \
+                   (qn(field.model._meta.db_table), qn(field.column), weight)
+        else:
+            return "setweight(to_tsvector('%s', coalesce(%s.%s, '')), '%s')" % \
+                   (config, qn(field.model._meta.db_table), qn(field.column), weight)
 
 
 class SearchQuerySet(QuerySet):
@@ -315,21 +351,7 @@ class SearchQuerySet(QuerySet):
                 "%s('%s', %s)" % (function, config, adapt(query))
             )
 
-            full_search_field = "%s.%s" % (
-                qn(self.model._meta.db_table),
-                qn(self.manager.search_field)
-            )
-
-            # if fields is passed, obtain a vector expression with
-            # these fields. In other case, intent use of search_field if
-            # exists.
-            if fields:
-                search_vector = self.manager._get_search_vector(config, using, fields=fields)
-            else:
-                if not self.manager.search_field:
-                    raise ValueError("search_field is not specified")
-
-                search_vector = full_search_field
+            search_vector = self.manager._get_search_vector(config, using, fields=fields)
 
             where = " (%s) @@ (%s)" % (search_vector, ts_query)
             select_dict, order = {}, []
