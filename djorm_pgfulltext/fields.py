@@ -14,8 +14,10 @@ from djorm_pgfulltext.utils import adapt
 
 class VectorField(models.Field):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, dictionary='simple', *args, **kwargs):
+        self.dictionary = dictionary
         kwargs['default'] = ''
+        kwargs['db_index'] = False
         kwargs['editable'] = False
         kwargs['serialize'] = False
         super(VectorField, self).__init__(*args, **kwargs)
@@ -25,6 +27,8 @@ class VectorField(models.Field):
         del kwargs['default']
         del kwargs['editable']
         del kwargs['serialize']
+        if self.dictionary != 'simple':
+            kwargs['dictionary'] = self.dictionary
         return name, path, args, kwargs
 
     def db_type(self, *args, **kwargs):
@@ -37,10 +41,16 @@ class VectorField(models.Field):
     #         return value._prepare()
     #     raise TypeError("Field has invalid lookup: %s" % lookup_type)
 
-    def get_db_prep_lookup(self, lookup_type, value, connection, prepared=False):
-        return self.get_prep_lookup(lookup_type, value)
+    # def get_db_prep_lookup(self, lookup_type, value, connection, prepared=False):
+    #     return self.get_prep_lookup(lookup_type, value)
 
-    def get_prep_value(self, value):
+    def get_db_prep_value(self, value, connection, prepared=False):
+        cursor = connection.cursor()
+        cursor.execute("SELECT to_tsvector(%s, coalesce(%s))",
+            (self.dictionary, value))
+        value = cursor.fetchone()
+        cursor.close()
+
         return value
 
 try:
